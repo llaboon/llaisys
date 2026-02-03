@@ -302,5 +302,3 @@ tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
 
 } // namespace llaisys
 
-
-} // namespace llaisys
