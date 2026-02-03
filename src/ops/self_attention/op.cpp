@@ -3,21 +3,31 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <limits> // 需要包含 limits
 
 namespace llaisys::ops {
 
 template <typename T>
 void self_attention_kernel(T *attn_val, const T *q, const T *k, const T *v, float scale,
                            size_t seq_len, size_t total_len, size_t n_heads, size_t head_dim) {
-
+    
     for (size_t s = 0; s < seq_len; s++) { // Query 序列
         for (size_t h = 0; h < n_heads; h++) { // Head
-
+            
             std::vector<float> scores(total_len);
-            float max_score = -1e9f;
+            float max_score = -std::numeric_limits<float>::infinity(); // 初始化为极小值
 
-            // 1. Q * K^T
+            // 1. Q * K^T (计算 Scores)
             for (size_t t = 0; t < total_len; t++) {
+                
+                // 【核心修复】 Causal Mask (因果掩码)
+                // 如果是 Prefill 阶段 (seq_len > 1)，我们假设 q 和 k 是对齐的。
+                // 此时，Query 不应该看到未来的 Key (t > s)。
+                if (seq_len > 1 && t > s) {
+                    scores[t] = -std::numeric_limits<float>::infinity();
+                    continue; // 跳过计算
+                }
+
                 float dot = 0.0f;
                 for (size_t d = 0; d < head_dim; d++) {
                     float q_val = llaisys::utils::cast<float>(q[(s * n_heads + h) * head_dim + d]);
@@ -31,14 +41,21 @@ void self_attention_kernel(T *attn_val, const T *q, const T *k, const T *v, floa
             // 2. Softmax
             float sum_exp = 0.0f;
             for (size_t t = 0; t < total_len; t++) {
-                scores[t] = std::exp(scores[t] - max_score);
+                if (scores[t] == -std::numeric_limits<float>::infinity()) {
+                    scores[t] = 0.0f; // exp(-inf) -> 0
+                } else {
+                    scores[t] = std::exp(scores[t] - max_score);
+                }
                 sum_exp += scores[t];
             }
-
-            // 3. Weighted Sum
+            
+            // 3. Weighted Sum (Score * V)
             for (size_t d = 0; d < head_dim; d++) {
                 float weighted_sum = 0.0f;
                 for (size_t t = 0; t < total_len; t++) {
+                    // 如果权重为0 (被mask了)，直接跳过乘法，节省计算
+                    if (scores[t] == 0.0f) continue; 
+
                     float prob = scores[t] / sum_exp;
                     float v_val = llaisys::utils::cast<float>(v[(t * n_heads + h) * head_dim + d]);
                     weighted_sum += prob * v_val;
@@ -50,16 +67,13 @@ void self_attention_kernel(T *attn_val, const T *q, const T *k, const T *v, floa
 }
 
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {
-    // 【修复】 shape -> shape()
     size_t seq_len = q->shape()[0];
     size_t n_heads = q->shape()[1];
     size_t head_dim = q->shape()[2];
-    size_t total_len = k->shape()[0];
+    size_t total_len = k->shape()[0]; 
 
-    // 【修复】 dtype -> dtype()
     switch (q->dtype()) {
     case LLAISYS_DTYPE_F32:
-        // 【修复】 data -> data()
         self_attention_kernel(reinterpret_cast<float*>(attn_val->data()),
                               reinterpret_cast<const float*>(q->data()),
                               reinterpret_cast<const float*>(k->data()),
