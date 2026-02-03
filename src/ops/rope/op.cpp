@@ -15,22 +15,25 @@ void rope_kernel(T *out, const T *in, const int64_t *pos_ids, float theta,
             size_t half_dim = head_dim / 2;
             
             for (size_t j = 0; j < half_dim; j++) {
-                // 【关键修改】使用 double 进行中间频率计算，以匹配 PyTorch 的精度
+                // 1. 频率计算维持 double
                 double freq_expon = -2.0 * static_cast<double>(j) / static_cast<double>(head_dim);
                 double freq = static_cast<double>(pos) * std::pow(static_cast<double>(theta), freq_expon);
                 
-                // cos/sin 也先在 double 下计算，减少误差
-                float cos_val = static_cast<float>(std::cos(freq));
-                float sin_val = static_cast<float>(std::sin(freq));
+                // 2. 三角函数维持 double
+                double cos_val = std::cos(freq);
+                double sin_val = std::sin(freq);
 
-                float x = llaisys::utils::cast<float>(in[offset + j]);
-                float y = llaisys::utils::cast<float>(in[offset + j + half_dim]);
+                // 3. 【关键修改】读取输入也转为 double
+                double x = static_cast<double>(llaisys::utils::cast<float>(in[offset + j]));
+                double y = static_cast<double>(llaisys::utils::cast<float>(in[offset + j + half_dim]));
 
-                float out_x = x * cos_val - y * sin_val;
-                float out_y = x * sin_val + y * cos_val;
+                // 4. 【关键修改】旋转运算全程使用 double，最大程度减少中间误差
+                double out_x = x * cos_val - y * sin_val;
+                double out_y = x * sin_val + y * cos_val;
 
-                out[offset + j] = llaisys::utils::cast<T>(out_x);
-                out[offset + j + half_dim] = llaisys::utils::cast<T>(out_y);
+                // 5. 最后再转回目标类型 T
+                out[offset + j] = llaisys::utils::cast<T>(static_cast<float>(out_x));
+                out[offset + j + half_dim] = llaisys::utils::cast<T>(static_cast<float>(out_y));
             }
         }
     }
