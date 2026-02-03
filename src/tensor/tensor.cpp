@@ -188,7 +188,7 @@ bool Tensor::isContiguous() const {
     // 从最后一个维度向前检查
     // 连续张量要求：stride[i] == stride[i+1] * shape[i+1]
     // 且最后一个维度的 stride 必须为 1
-    for (int i = _meta.shape.size() - 1; i >= 0; --i) {
+    for (int i = static_cast<int>(_meta.shape.size()) - 1; i >= 0; --i) {
         if (_meta.strides[i] != static_cast<ptrdiff_t>(z)) {
             return false;
         }
@@ -241,7 +241,7 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
     // 重新计算连续的 strides
     std::vector<ptrdiff_t> new_strides(shape.size());
     size_t z = 1;
-    for (int i = shape.size() - 1; i >= 0; --i) {
+    for (int i = static_cast<int>(shape.size()) - 1; i >= 0; --i) {
         new_strides[i] = static_cast<ptrdiff_t>(z);
         z *= shape[i];
     }
