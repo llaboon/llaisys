@@ -2,10 +2,9 @@
 #include "llaisys/tensor.h"
 
 // =====================================================
-// 【关键修复】必须包含 Tensor 定义
+// 【关键】必须包含 Tensor 类的定义
 // =====================================================
 #include "../tensor/tensor.hpp"
-// #include "../utils.hpp" 
 
 #include <vector>
 #include <iostream>
@@ -13,18 +12,20 @@
 #include <cmath>
 #include <algorithm>
 #include <memory> 
+#include <cstddef> // for std::byte
 
 // =====================================================
-// 【关键修复】补充 tensor_t 定义
+// 【关键】补充 tensor_t 定义
 // =====================================================
 namespace llaisys {
+    // 确保 tensor_t 被正确定义为 Tensor 的智能指针
     using tensor_t = std::shared_ptr<Tensor>;
 }
 
 using namespace llaisys;
 
 // =====================================================
-// 1. 宏定义修复
+// 【关键】宏定义 (防止链接时符号不可见)
 // =====================================================
 #ifndef LLAISYS_EXPORT
     #if defined(_WIN32)
@@ -35,7 +36,7 @@ using namespace llaisys;
 #endif
 
 // =====================================================
-// 2. 算子声明
+// 算子声明
 // =====================================================
 namespace llaisys::ops {
     void embedding(tensor_t out, tensor_t index, tensor_t weight);
@@ -48,11 +49,12 @@ namespace llaisys::ops {
 }
 
 // =====================================================
-// 3. 辅助函数
+// 辅助函数
 // =====================================================
 void tensor_add(tensor_t dst, tensor_t src) {
     if (dst->numel() != src->numel()) return;
     
+    // 假设都是 FP32 (Python端已处理BF16转FP32)
     if (dst->dtype() == LLAISYS_DTYPE_F32) {
         float* d = (float*)dst->data();
         float* s = (float*)src->data();
@@ -61,7 +63,7 @@ void tensor_add(tensor_t dst, tensor_t src) {
 }
 
 // =====================================================
-// 4. Qwen2 模型类
+// Qwen2 模型类
 // =====================================================
 struct LlaisysQwen2Model {
     LlaisysQwen2Meta meta;
@@ -73,6 +75,7 @@ struct LlaisysQwen2Model {
     int64_t current_pos = 0;
     
     LlaisysQwen2Model(const LlaisysQwen2Meta *m) : meta(*m) {
+        // 使用 () 初始化数组，确保指针被清零
         weights.attn_norm_w = new llaisysTensor_t[meta.nlayer]();
         weights.attn_q_w = new llaisysTensor_t[meta.nlayer]();
         weights.attn_q_b = new llaisysTensor_t[meta.nlayer]();
@@ -109,7 +112,7 @@ struct LlaisysQwen2Model {
 };
 
 // =====================================================
-// 5. C API 实现
+// C API 实现
 // =====================================================
 
 LLAISYS_EXPORT LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice) {
@@ -131,17 +134,18 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
     llaisysDataType_t compute_dtype = LLAISYS_DTYPE_F32; 
 
     // 0. 输入 Tensor
-    // 【修改】使用 (size_t) 替代 (long)
+    // 【修复】强转 (size_t) 避免 narrowing conversion
     auto input = Tensor::create({(size_t)ntoken}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU);
     input->load(token_ids); 
 
     // 1. 初始化 KV Cache
     if (model->k_cache.empty()) {
         for(size_t i=0; i<meta.nlayer; ++i) {
-            // 【修改】使用 (size_t)
+            // 【修复】所有维度强转 (size_t)
             auto k_c = Tensor::create({(size_t)meta.maxseq, (size_t)meta.nkvh, (size_t)meta.dh}, compute_dtype, LLAISYS_DEVICE_CPU);
             auto v_c = Tensor::create({(size_t)meta.maxseq, (size_t)meta.nkvh, (size_t)meta.dh}, compute_dtype, LLAISYS_DEVICE_CPU);
             
+            // 手动计算字节并清零
             size_t cache_bytes = k_c->numel() * sizeof(float);
             std::memset(k_c->data(), 0, cache_bytes);
             std::memset(v_c->data(), 0, cache_bytes);
@@ -152,7 +156,6 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
     }
 
     // 2. Embedding
-    // 【修改】使用 (size_t)
     auto x = Tensor::create({(size_t)ntoken, (size_t)meta.hs}, compute_dtype, LLAISYS_DEVICE_CPU);
     if (w.in_embed) {
         ops::embedding(x, input, model->get_tensor(w.in_embed));
@@ -167,22 +170,21 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
         auto norm_out = Tensor::create(x->shape(), compute_dtype, LLAISYS_DEVICE_CPU);
         ops::rms_norm(norm_out, x, model->get_tensor(w.attn_norm_w[i]), meta.epsilon);
         
-        // 【修改】使用 (size_t)
         auto q = Tensor::create({(size_t)ntoken, (size_t)meta.nh, (size_t)meta.dh}, compute_dtype, LLAISYS_DEVICE_CPU);
         auto k = Tensor::create({(size_t)ntoken, (size_t)meta.nkvh, (size_t)meta.dh}, compute_dtype, LLAISYS_DEVICE_CPU);
         auto v = Tensor::create({(size_t)ntoken, (size_t)meta.nkvh, (size_t)meta.dh}, compute_dtype, LLAISYS_DEVICE_CPU);
         
-        // 【修改】使用 (size_t)
+        // 【修复】强转乘积结果为 (size_t)
         auto q_view = q->view({(size_t)ntoken, (size_t)(meta.nh * meta.dh)});
         auto k_view = k->view({(size_t)ntoken, (size_t)(meta.nkvh * meta.dh)});
         auto v_view = v->view({(size_t)ntoken, (size_t)(meta.nkvh * meta.dh)});
         
+        // 【关键】Bias 传 nullptr
         ops::linear(q_view, norm_out, model->get_tensor(w.attn_q_w[i]), nullptr);
         ops::linear(k_view, norm_out, model->get_tensor(w.attn_k_w[i]), nullptr);
         ops::linear(v_view, norm_out, model->get_tensor(w.attn_v_w[i]), nullptr);
 
         // RoPE
-        // 【修改】使用 (size_t)
         auto pos_ids = Tensor::create({(size_t)ntoken}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU);
         std::vector<int64_t> pos_vec(ntoken);
         for(size_t p=0; p<ntoken; ++p) pos_vec[p] = model->current_pos + p;
@@ -196,7 +198,8 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
         size_t kv_len_bytes = ntoken * meta.nkvh * head_dim_bytes;
         size_t offset_bytes = model->current_pos * meta.nkvh * head_dim_bytes;
         
-        if (model->current_pos < meta.maxseq) {
+        // 【修复】强转 (size_t) 解决 signed/unsigned comparison 报错
+        if ((size_t)model->current_pos < meta.maxseq) {
              std::byte* k_cache_ptr = (std::byte*)model->k_cache[i]->data();
              std::byte* v_cache_ptr = (std::byte*)model->v_cache[i]->data();
              std::memcpy(k_cache_ptr + offset_bytes, k->data(), kv_len_bytes);
@@ -205,17 +208,14 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
 
         size_t total_seq_len = model->current_pos + ntoken;
         
-        // 【修改】使用 (size_t)
         auto k_full = model->k_cache[i]->slice(0, 0, (size_t)total_seq_len);
         auto v_full = model->v_cache[i]->slice(0, 0, (size_t)total_seq_len);
 
-        // 【修改】使用 (size_t)
         auto attn_out = Tensor::create({(size_t)ntoken, (size_t)meta.nh, (size_t)meta.dh}, compute_dtype, LLAISYS_DEVICE_CPU);
         float scale = 1.0f / sqrtf((float)meta.dh);
         
         ops::self_attention(attn_out, q, k_full, v_full, scale);
 
-        // 【修改】使用 (size_t)
         auto attn_out_view = attn_out->view({(size_t)ntoken, (size_t)(meta.nh * meta.dh)});
         ops::linear(x, attn_out_view, model->get_tensor(w.attn_o_w[i]), nullptr);
         
@@ -225,7 +225,6 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
         // --- MLP ---
         ops::rms_norm(norm_out, x, model->get_tensor(w.mlp_norm_w[i]), meta.epsilon);
         
-        // 【修改】使用 (size_t)
         auto gate = Tensor::create({(size_t)ntoken, (size_t)meta.di}, compute_dtype, LLAISYS_DEVICE_CPU);
         auto up = Tensor::create({(size_t)ntoken, (size_t)meta.di}, compute_dtype, LLAISYS_DEVICE_CPU);
         
@@ -244,7 +243,6 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
     ops::rms_norm(final_norm, x, model->get_tensor(w.out_norm_w), meta.epsilon);
 
     // 5. Logits
-    // 【修改】使用 (size_t)
     auto last_hidden = final_norm->slice(0, (size_t)ntoken - 1, (size_t)ntoken); 
     auto logits = Tensor::create({1, (size_t)meta.voc}, compute_dtype, LLAISYS_DEVICE_CPU);
     
