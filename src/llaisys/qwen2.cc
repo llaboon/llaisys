@@ -1,7 +1,7 @@
 #include "llaisys/models/qwen2.h"
 #include "llaisys/tensor.h"
 
-// 【关键】必须包含 Tensor 类的定义
+// 必须包含 Tensor 类定义，因为 tensor_t 是 shared_ptr<Tensor>
 #include "../tensor/tensor.hpp"
 
 #include <vector>
@@ -12,16 +12,9 @@
 #include <memory> 
 #include <cstddef> // for std::byte
 
-// =====================================================
-// 【关键修复】回归原始指针，解决 ABI 导致的段错误
-// =====================================================
-namespace llaisys {
-    using tensor_t = Tensor*; 
-}
-
 using namespace llaisys;
 
-// 宏定义 (防止符号不可见)
+// 宏定义
 #ifndef LLAISYS_EXPORT
     #if defined(_WIN32)
         #define LLAISYS_EXPORT __declspec(dllexport)
@@ -31,9 +24,10 @@ using namespace llaisys;
 #endif
 
 // =====================================================
-// 算子声明 (使用 Tensor*)
+// 算子声明
 // =====================================================
 namespace llaisys::ops {
+    // tensor_t 已经在 tensor.hpp 中定义为 std::shared_ptr<Tensor>
     void embedding(tensor_t out, tensor_t index, tensor_t weight);
     void rms_norm(tensor_t out, tensor_t in, tensor_t weight, float eps);
     void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias);
@@ -49,7 +43,6 @@ namespace llaisys::ops {
 void tensor_add(tensor_t dst, tensor_t src) {
     if (dst->numel() != src->numel()) return;
     
-    // 假设都是 FP32
     if (dst->dtype() == LLAISYS_DTYPE_F32) {
         float* d = (float*)dst->data();
         float* s = (float*)src->data();
@@ -64,14 +57,13 @@ struct LlaisysQwen2Model {
     LlaisysQwen2Meta meta;
     LlaisysQwen2Weights weights;
     
-    // KV Cache 存储原始指针
+    // KV Cache 使用智能指针，无需手动管理内存
     std::vector<tensor_t> k_cache;
     std::vector<tensor_t> v_cache;
     
     int64_t current_pos = 0;
     
     LlaisysQwen2Model(const LlaisysQwen2Meta *m) : meta(*m) {
-        // 使用 () 初始化数组，确保指针被清零
         weights.attn_norm_w = new llaisysTensor_t[meta.nlayer]();
         weights.attn_q_w = new llaisysTensor_t[meta.nlayer]();
         weights.attn_q_b = new llaisysTensor_t[meta.nlayer]();
@@ -97,17 +89,19 @@ struct LlaisysQwen2Model {
         delete[] weights.mlp_up_w;
         delete[] weights.mlp_down_w;
         
-        // 清理 KV Cache
-        for(auto p : k_cache) delete p;
-        for(auto p : v_cache) delete p;
+        // k_cache, v_cache 是 vector<shared_ptr>，会自动释放，不需要手动 delete
         k_cache.clear();
         v_cache.clear();
     }
     
-    // 【关键修复】直接转换原始指针，不再使用 shared_ptr 包装
+    // 【核心修复】将原始指针封装为 shared_ptr，但使用空删除器
+    // 这样既满足了 tensor_t (shared_ptr) 的类型要求，又不会 double free
     tensor_t get_tensor(llaisysTensor_t t) {
         if (!t) return nullptr;
-        return reinterpret_cast<Tensor*>(t);
+        
+        // t 是 Tensor* (raw pointer)
+        // 创建一个指向它的 shared_ptr，但 deleter 里面什么都不做
+        return std::shared_ptr<Tensor>(reinterpret_cast<Tensor*>(t), [](Tensor*){});
     }
 };
 
@@ -127,10 +121,6 @@ LLAISYS_EXPORT LlaisysQwen2Weights *llaisysQwen2ModelWeights(LlaisysQwen2Model *
     return &model->weights;
 }
 
-// 辅助：用于自动释放临时 Tensor 的简单 RAII (可选，防止内存泄漏)
-// 为了代码简洁，下面的实现中如果不加 auto-release，会泄漏中间 tensor，
-// 但不会 crash。为了保证通过测试，这里展示直接逻辑。
-
 LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
     auto &meta = model->meta;
     auto &w = model->weights;
@@ -138,8 +128,7 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
     llaisysDataType_t compute_dtype = LLAISYS_DTYPE_F32; 
 
     // 0. 输入 Tensor
-    // 【注意】这里假设 Tensor::create 返回的是 Tensor* (raw pointer)
-    // 如果返回的是 smart pointer，我们需要 .get()，但通常 create 返回 raw pointer
+    // Tensor::create 返回的就是 tensor_t (shared_ptr)，会自动管理内存
     auto input = Tensor::create({(size_t)ntoken}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU);
     input->load(token_ids); 
 
@@ -236,12 +225,6 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
         ops::linear(x, gate, model->get_tensor(w.mlp_down_w[i]), nullptr);
         
         tensor_add(x, residual);
-
-        // 清理当前层的临时 Tensor (避免堆积太多内存，虽非必须但推荐)
-        delete residual; delete norm_out; delete q; delete k; delete v;
-        delete q_view; delete k_view; delete v_view; delete pos_ids;
-        delete k_full; delete v_full; delete attn_out; delete attn_out_view;
-        delete gate; delete up;
     }
 
     // 4. Final Norm
@@ -263,10 +246,6 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
     int64_t next_token = ((int64_t*)max_idx->data())[0];
     
     model->current_pos += ntoken;
-
-    // 清理最后的临时对象
-    delete input; delete x; delete final_norm; delete last_hidden;
-    delete logits; delete max_val; delete max_idx;
 
     return next_token;
 }
