@@ -5,7 +5,7 @@
 #include <iostream>
 #include <cstring>
 #include <cmath>
-
+#include "../tensor/tensor.hpp"
 using namespace llaisys;
 
 // ==========================================
