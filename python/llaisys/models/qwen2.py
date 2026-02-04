@@ -65,7 +65,7 @@ class Qwen2:
                     slice_ = f.get_slice(name)
                     shape = slice_.get_shape()
                     dtype_str = slice_.get_dtype()
-
+                    print(f"DEBUG: name={name}, dtype={dtype_str}")
                     if dtype_str == "bfloat16":
                         # 读取原始字节，保留位模式，将其视为 uint16
                         raw_bytes = slice_[:]
