@@ -34,7 +34,7 @@ jobs:
     - name: Install Python
       run: | 
         cd python
-        pip install .
+        pip install -e .
         cd ..
 
     - name: Assignment-0
