@@ -15,7 +15,12 @@ class Qwen2:
         model_path = Path(model_path)
         
         # 1. Load Config
-        with open(model_path / "config.json", "r") as f:
+        # 确保路径存在
+        config_path = model_path / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config not found at {config_path}")
+
+        with open(config_path, "r") as f:
             cfg = json.load(f)
             
         self.meta = LlaisysQwen2Meta()
@@ -25,12 +30,12 @@ class Qwen2:
         self.meta.nkvh = cfg["num_key_value_heads"]
         self.meta.dh = self.meta.hs // self.meta.nh
         self.meta.di = cfg["intermediate_size"]
-        self.meta.maxseq = 2048 # 默认或从config读取
+        self.meta.maxseq = 2048 # 默认或从config读取，如 cfg.get("max_position_embeddings", 2048)
         self.meta.voc = cfg["vocab_size"]
         self.meta.epsilon = cfg["rms_norm_eps"]
         self.meta.theta = cfg.get("rope_theta", 10000.0)
         self.meta.end_token = 151643 # EOS Token ID
-        self.meta.dtype = 0 # 假设 FP32=0, 具体需要映射 llaisysDataType_t
+        self.meta.dtype = 0 # 0通常代表 FP32，但你的数据实际上是 BF16 (uint16格式传给C)，这里可能需要根据你的 C enum调整
         
         # 2. Create Model
         self.model_ptr = LIB_LLAISYS.llaisysQwen2ModelCreate(
@@ -47,27 +52,42 @@ class Qwen2:
 
         # 4. Load Weights
         print("Loading weights...")
-        for file in sorted(model_path.glob("*.safetensors")):
+        safetensor_files = sorted(model_path.glob("*.safetensors"))
+        if not safetensor_files:
+            raise FileNotFoundError(f"No .safetensors files found in {model_path}")
+
+        for file in safetensor_files:
+            # 使用 safetensors.numpy 打开，但在遇到 bfloat16 时手动处理
             with safetensors.numpy.safe_open(file, framework="numpy", device="cpu") as f:
                 for name in f.keys():
-                    # Load numpy array
-                    np_data = f.get_tensor(name)
+                    
+                    # --- 核心修改：处理 bfloat16 ---
+                    slice_ = f.get_slice(name)
+                    shape = slice_.get_shape()
+                    dtype_str = slice_.get_dtype()
+
+                    if dtype_str == "bfloat16":
+                        # 读取原始字节，保留位模式，将其视为 uint16
+                        raw_bytes = slice_[:]
+                        np_data = np.frombuffer(raw_bytes, dtype=np.uint16)
+                        np_data = np_data.reshape(shape)
+                    else:
+                        # 对于 float32 等常规类型，直接读取
+                        np_data = f.get_tensor(name)
+                    # ----------------------------
+
                     # Convert to LLAISYS Tensor
-                    tensor = Tensor.from_numpy(np_data) # 假设有这个helper，或者手动from_list
+                    tensor = Tensor.from_numpy(np_data) 
                     self.tensors.append(tensor)
                     lib_tensor = tensor.lib_tensor()
 
                     # Map name to C struct
-                    # model.embed_tokens.weight
                     if name == "model.embed_tokens.weight":
                         self.weights.in_embed = lib_tensor
-                    # lm_head.weight
                     elif name == "lm_head.weight":
                         self.weights.out_embed = lib_tensor
-                    # model.norm.weight
                     elif name == "model.norm.weight":
                         self.weights.out_norm_w = lib_tensor
-                    # Layers
                     elif name.startswith("model.layers."):
                         parts = name.split(".")
                         idx = int(parts[2]) # layers.0
@@ -90,14 +110,14 @@ class Qwen2:
                             elif "down_proj" in proj: self.weights.mlp_down_w[idx] = lib_tensor
 
     def __del__(self):
-        if hasattr(self, "model_ptr"):
+        if hasattr(self, "model_ptr") and self.model_ptr:
             LIB_LLAISYS.llaisysQwen2ModelDestroy(self.model_ptr)
 
     def generate(
         self,
         inputs: Sequence[int],
         max_new_tokens: int = 100,
-        top_k: int = 1, # Not implemented in C API yet (always argmax)
+        top_k: int = 1, 
         top_p: float = 0.8,
         temperature: float = 0.8,
     ):
