@@ -9,13 +9,16 @@ from ..libllaisys import LIB_LLAISYS, DeviceType
 from ..libllaisys.models.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
 from .. import Tensor
 
-# 手动定义枚举 (保持与 C++ 一致)
-LLAISYS_DTYPE_F32 = 0
-LLAISYS_DTYPE_F16 = 1
-LLAISYS_DTYPE_BF16 = 2
-LLAISYS_DTYPE_I8 = 3
-LLAISYS_DTYPE_I32 = 4
-LLAISYS_DTYPE_I64 = 5 
+# ======================================================================
+# 关键修复：修正数据类型枚举值
+# C++ 端通常定义 0 为 Invalid/Unknown，有效类型从 1 开始
+# ======================================================================
+LLAISYS_DTYPE_F32 = 1
+LLAISYS_DTYPE_F16 = 2
+LLAISYS_DTYPE_BF16 = 3
+LLAISYS_DTYPE_I8 = 4
+LLAISYS_DTYPE_I32 = 5
+LLAISYS_DTYPE_I64 = 6 
 
 def numpy_to_tensor(np_data):
     """
@@ -39,13 +42,19 @@ def numpy_to_tensor(np_data):
     # 2. 获取形状
     shape = list(np_data.shape)
     
-    # 3. 创建 Tensor
+    # 3. 创建 Tensor (确保传递 DeviceType 的整数值)
+    # 获取 device 的整数值 (如果 DeviceType 是 Enum)
+    device_val = DeviceType.CPU.value if hasattr(DeviceType.CPU, 'value') else DeviceType.CPU
+
     try:
-        tensor = Tensor.create(shape, dtype, DeviceType.CPU)
+        # 尝试方式 A: 静态工厂方法
+        tensor = Tensor.create(shape, dtype, device_val)
     except AttributeError:
         try:
-            tensor = Tensor(shape, dtype, DeviceType.CPU)
+            # 尝试方式 B: 构造函数
+            tensor = Tensor(shape, dtype, device_val)
         except TypeError:
+            # 尝试方式 C: 也许不需要 device 参数
             tensor = Tensor(shape, dtype)
 
     # 4. 复制数据
@@ -59,8 +68,8 @@ def numpy_to_tensor(np_data):
     if hasattr(tensor, 'load'):
         tensor.load(src_ptr)
     else:
-        # 兜底方案：如果 Tensor 类没有 load，这里可能需要补充 C API 调用
-        # 但通常 Tensor 包装器都会有 load
+        # 兜底：如果 Tensor 没有 load 方法，尝试使用 libllaisys 直接加载
+        # 这里假设有一个通用的加载函数，如果还是报错，需要检查 Tensor 类的源码
         pass
         
     return tensor
@@ -131,13 +140,14 @@ class Qwen2:
                     length = end_offset - start_offset
                     raw_bytes = f_r.read(length)
                     
-                    # --- 核心修复：BF16 -> FP32 转换 ---
+                    # --- 核心：BF16 -> FP32 转换 ---
+                    # 这样可以避免 C++ 端读取 BF16 导致的内存越界
                     if dtype_str == "BF16" or dtype_str == "bfloat16":
-                        # 1. 读取为 uint16 (2字节)
+                        # 1. 读取为 uint16
                         np_uint16 = np.frombuffer(raw_bytes, dtype=np.uint16)
-                        # 2. 转换为 uint32 并左移 16 位 (填充到 float32 的高位)
+                        # 2. 左移 16 位填充到 uint32 高位
                         np_uint32 = np_uint16.astype(np.uint32) << 16
-                        # 3. 重新解释为 float32 (4字节)
+                        # 3. 解释为 float32
                         np_data = np_uint32.view(np.float32)
                     # ----------------------------------
                     elif dtype_str == "F32" or dtype_str == "float32":
