@@ -1,6 +1,7 @@
 #include "llaisys/models/qwen2.h"
 #include "llaisys/tensor.h"
 #include "../ops/op.hpp" // 引用之前的算子
+#include "../../utils.hpp" // 引用 cast 工具
 #include <vector>
 #include <iostream>
 #include <cstring>
@@ -8,20 +9,55 @@
 
 using namespace llaisys;
 
+// ==========================================
+// Helper: Tensor Addition (Residual Connection)
+// ==========================================
+template <typename T>
+void add_kernel(std::byte* dst_bytes, const std::byte* src_bytes, size_t numel) {
+    T* dst = reinterpret_cast<T*>(dst_bytes);
+    const T* src = reinterpret_cast<const T*>(src_bytes);
+    for (size_t i = 0; i < numel; ++i) {
+        float a = utils::cast<float>(dst[i]);
+        float b = utils::cast<float>(src[i]);
+        dst[i] = utils::cast<T>(a + b);
+    }
+}
+
+void tensor_add(tensor_t dst, tensor_t src) {
+    if (dst->dtype() != src->dtype() || dst->numel() != src->numel()) {
+        std::cerr << "Tensor Add mismatch!" << std::endl;
+        return;
+    }
+    switch (dst->dtype()) {
+        case LLAISYS_DTYPE_F32:
+            add_kernel<float>(dst->data(), src->data(), dst->numel());
+            break;
+        case LLAISYS_DTYPE_F16:
+            add_kernel<fp16_t>(dst->data(), src->data(), dst->numel());
+            break;
+        case LLAISYS_DTYPE_BF16:
+            add_kernel<bf16_t>(dst->data(), src->data(), dst->numel());
+            break;
+        default:
+            break;
+    }
+}
+
+// ==========================================
+// Qwen2 Model Structure
+// ==========================================
 struct LlaisysQwen2Model {
     LlaisysQwen2Meta meta;
     LlaisysQwen2Weights weights;
     
-    // KV Cache: [layer][k/v]
-    // 为了简单，我们直接存 Tensor 对象
+    // KV Cache: [layer]
     std::vector<tensor_t> k_cache;
     std::vector<tensor_t> v_cache;
     
     int64_t current_pos = 0;
     
-    // 构造函数：分配权重数组空间和 KV Cache
     LlaisysQwen2Model(const LlaisysQwen2Meta *m) : meta(*m) {
-        // 1. 分配权重指针数组
+        // 分配权重指针数组 (初始化为 nullptr)
         weights.attn_norm_w = new llaisysTensor_t[meta.nlayer]();
         weights.attn_q_w = new llaisysTensor_t[meta.nlayer]();
         weights.attn_q_b = new llaisysTensor_t[meta.nlayer]();
@@ -34,19 +70,13 @@ struct LlaisysQwen2Model {
         weights.mlp_gate_w = new llaisysTensor_t[meta.nlayer]();
         weights.mlp_up_w = new llaisysTensor_t[meta.nlayer]();
         weights.mlp_down_w = new llaisysTensor_t[meta.nlayer]();
-
-        // 2. 初始化 KV Cache (这里仅仅是占位，真正分配需要在 infer 中拿到 dtype 后，或者这里默认 fp32/bf16)
-        // 假设我们会在第一次 infer 时根据权重 dtype 初始化 cache
     }
 
     ~LlaisysQwen2Model() {
         delete[] weights.attn_norm_w;
-        delete[] weights.attn_q_w;
-        delete[] weights.attn_q_b;
-        delete[] weights.attn_k_w;
-        delete[] weights.attn_k_b;
-        delete[] weights.attn_v_w;
-        delete[] weights.attn_v_b;
+        delete[] weights.attn_q_w; delete[] weights.attn_q_b;
+        delete[] weights.attn_k_w; delete[] weights.attn_k_b;
+        delete[] weights.attn_v_w; delete[] weights.attn_v_b;
         delete[] weights.attn_o_w;
         delete[] weights.mlp_norm_w;
         delete[] weights.mlp_gate_w;
@@ -54,16 +84,17 @@ struct LlaisysQwen2Model {
         delete[] weights.mlp_down_w;
     }
     
-    // 辅助：获取 Tensor 指针 (llaisysTensor_t 是 void*，强转为 tensor_t 智能指针)
+    // 安全地从 void* 恢复 shared_ptr<Tensor>
     tensor_t get_tensor(llaisysTensor_t t) {
         if (!t) return nullptr;
-        // 假设 llaisysTensor_t 是 tensor_t (std::shared_ptr<Tensor>) 的 raw pointer 或者直接就是对象
-        // 根据 tensor.h 的定义，通常它是 void* 指向 std::shared_ptr<Tensor>
-        return *(tensor_t*)t;
+        // 假设 Python 传递的是指向 shared_ptr 的指针
+        return *reinterpret_cast<tensor_t*>(t);
     }
 };
 
-// C API 实现
+// ==========================================
+// C API Implementation
+// ==========================================
 extern "C" {
 
 LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice) {
@@ -83,17 +114,17 @@ int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token_ids, siz
     auto &w = model->weights;
     
     // 0. 准备 Input Tensor
-    // 必须拷贝 token_ids 到 Tensor
     auto input = Tensor::create({ntoken}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU);
-    input->load(token_ids); // Copy from host
+    input->load(token_ids); 
 
-    // 获取 embedding table 用于确定 dtype
+    // 获取 Embedding 权重以确定数据类型 (FP32/BF16)
     auto embed_w = model->get_tensor(w.in_embed);
     auto dtype = embed_w->dtype();
     
-    // 初始化 KV Cache (如果还没初始化)
+    // 懒加载初始化 KV Cache
     if (model->k_cache.empty()) {
         for(size_t i=0; i<meta.nlayer; ++i) {
+            // Cache Shape: [max_seq, nkvh, head_dim]
             model->k_cache.push_back(Tensor::create({meta.maxseq, meta.nkvh, meta.dh}, dtype, LLAISYS_DEVICE_CPU));
             model->v_cache.push_back(Tensor::create({meta.maxseq, meta.nkvh, meta.dh}, dtype, LLAISYS_DEVICE_CPU));
         }
@@ -105,31 +136,28 @@ int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token_ids, siz
 
     // 2. Layers Loop
     for (size_t i = 0; i < meta.nlayer; ++i) {
-        auto residual = x; // 记录残差
+        auto residual = x; // 保存残差输入
         
         // --- Attention Block ---
         // RMS Norm
         auto norm_out = Tensor::create(x->shape(), dtype, LLAISYS_DEVICE_CPU);
         ops::rms_norm(norm_out, x, model->get_tensor(w.attn_norm_w[i]), meta.epsilon);
         
-        // QKV Proj
-        // 注意：Linear 算子会自动处理 shape
-        // Q: [ntoken, nh, dh]
+        // QKV Projection
         auto q = Tensor::create({ntoken, meta.nh, meta.dh}, dtype, LLAISYS_DEVICE_CPU);
         auto k = Tensor::create({ntoken, meta.nkvh, meta.dh}, dtype, LLAISYS_DEVICE_CPU);
         auto v = Tensor::create({ntoken, meta.nkvh, meta.dh}, dtype, LLAISYS_DEVICE_CPU);
         
-        // Flatten for Linear: [ntoken, dim]
-        auto q_view = q->view({ntoken, meta.nh * meta.dh});
-        auto k_view = k->view({ntoken, meta.nkvh * meta.dh});
-        auto v_view = v->view({ntoken, meta.nkvh * meta.dh});
+        // View for Linear: [ntoken, hidden]
+        auto q_flat = q->view({ntoken, meta.nh * meta.dh});
+        auto k_flat = k->view({ntoken, meta.nkvh * meta.dh});
+        auto v_flat = v->view({ntoken, meta.nkvh * meta.dh});
         
-        ops::linear(q_view, norm_out, model->get_tensor(w.attn_q_w[i]), model->get_tensor(w.attn_q_b[i]));
-        ops::linear(k_view, norm_out, model->get_tensor(w.attn_k_w[i]), model->get_tensor(w.attn_k_b[i]));
-        ops::linear(v_view, norm_out, model->get_tensor(w.attn_v_w[i]), model->get_tensor(w.attn_v_b[i]));
+        ops::linear(q_flat, norm_out, model->get_tensor(w.attn_q_w[i]), model->get_tensor(w.attn_q_b[i]));
+        ops::linear(k_flat, norm_out, model->get_tensor(w.attn_k_w[i]), model->get_tensor(w.attn_k_b[i]));
+        ops::linear(v_flat, norm_out, model->get_tensor(w.attn_v_w[i]), model->get_tensor(w.attn_v_b[i]));
         
         // RoPE
-        // 构造 pos_ids [start, ..., start + ntoken]
         auto pos_ids = Tensor::create({ntoken}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU);
         std::vector<int64_t> pos_vec(ntoken);
         for(size_t p=0; p<ntoken; ++p) pos_vec[p] = model->current_pos + p;
@@ -138,55 +166,37 @@ int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token_ids, siz
         ops::rope(q, q, pos_ids, meta.theta);
         ops::rope(k, k, pos_ids, meta.theta);
         
-        // Update KV Cache
-        // 将当前 k, v 拷贝到 cache 的 [current_pos] 位置
-        // 简单内存拷贝 (需要根据 dtype 计算字节大小)
+        // KV Cache Update
+        // 计算偏移量: current_pos * nkvh * dh * element_size
         size_t element_size = q->elementSize();
-        size_t k_bytes = ntoken * meta.nkvh * meta.dh * element_size;
+        size_t offset_bytes = model->current_pos * meta.nkvh * meta.dh * element_size;
+        size_t copy_bytes = ntoken * meta.nkvh * meta.dh * element_size;
         
-        // 获取 Cache 中对应位置的指针
-        uint8_t* k_cache_ptr = (uint8_t*)model->k_cache[i]->data() + model->current_pos * meta.nkvh * meta.dh * element_size;
-        uint8_t* v_cache_ptr = (uint8_t*)model->v_cache[i]->data() + model->current_pos * meta.nkvh * meta.dh * element_size;
+        // 直接内存拷贝到 Cache Tensor 的对应位置
+        std::byte* k_dst = model->k_cache[i]->data() + offset_bytes;
+        std::byte* v_dst = model->v_cache[i]->data() + offset_bytes;
         
-        memcpy(k_cache_ptr, k->data(), k_bytes);
-        memcpy(v_cache_ptr, v->data(), k_bytes); // v size same as k
+        std::memcpy(k_dst, k->data(), copy_bytes);
+        std::memcpy(v_dst, v->data(), copy_bytes);
         
-        // Prepare K, V for Attention (View of Cache up to current_pos + ntoken)
-        // 这里的 Slice 必须是 contiguous 的，或者 self_attention 支持 stride
-        // 假设 self_attention 接受的 k, v 是 [total_len, nkvh, dh]
-        // 我们利用 slice (假设作业2实现了 slice) 或者直接创建一个 view 指向 cache 开头
-        // 为了简单，我们只传递 cache 本身，但在 self_attention 内部，total_len 参数控制读取长度
+        // Prepare K, V for Attention (View of Cache)
+        // 从 Cache 中切片出 [0, current_pos + ntoken]
         size_t total_len = model->current_pos + ntoken;
-        
-        auto k_total = model->k_cache[i]; // 全量 cache
-        auto v_total = model->v_cache[i];
-        // *关键*：需要告诉 self_attention 真实的有效长度是 total_len，而不是 max_seq
-        // 作业2的 self_attention 原型是 (attn_val, q, k, v, scale)
-        // 它内部使用 k->shape[0] 作为 total_len。所以我们必须 slice 出来。
-        auto k_active = k_total->slice(0, 0, total_len);
-        auto v_active = v_total->slice(0, 0, total_len);
+        auto k_active = model->k_cache[i]->slice(0, 0, total_len);
+        auto v_active = model->v_cache[i]->slice(0, 0, total_len);
 
         // Self Attention
         auto attn_out = Tensor::create({ntoken, meta.nh, meta.dh}, dtype, LLAISYS_DEVICE_CPU);
         float scale = 1.0f / sqrtf((float)meta.dh);
         ops::self_attention(attn_out, q, k_active, v_active, scale);
         
-        // O Proj
-        auto attn_out_view = attn_out->view({ntoken, meta.nh * meta.dh});
+        // Output Projection
+        auto attn_out_flat = attn_out->view({ntoken, meta.nh * meta.dh});
         auto o_out = Tensor::create(x->shape(), dtype, LLAISYS_DEVICE_CPU);
-        ops::linear(o_out, attn_out_view, model->get_tensor(w.attn_o_w[i]), nullptr);
+        ops::linear(o_out, attn_out_flat, model->get_tensor(w.attn_o_w[i]), nullptr);
         
-        // Residual Add 1: x = residual + o_out
-        // 手动实现 add 循环，或假设有 ops::add
-        // 这里为了作业完整性，模拟 ops::add
-        {
-             // 简单 float add 模拟
-             float* dst = (float*)x->data();
-             float* src1 = (float*)residual->data();
-             float* src2 = (float*)o_out->data();
-             for(size_t j=0; j<x->numel(); ++j) dst[j] = src1[j] + src2[j];
-        }
-
+        // Residual Add 1: x = x + o_out
+        tensor_add(x, o_out);
         residual = x; // 更新残差基准
 
         // --- MLP Block ---
@@ -207,25 +217,19 @@ int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token_ids, siz
         auto mlp_out = Tensor::create(x->shape(), dtype, LLAISYS_DEVICE_CPU);
         ops::linear(mlp_out, mlp_act, model->get_tensor(w.mlp_down_w[i]), nullptr);
         
-        // Residual Add 2
-        {
-             float* dst = (float*)x->data();
-             float* src1 = (float*)residual->data();
-             float* src2 = (float*)mlp_out->data();
-             for(size_t j=0; j<x->numel(); ++j) dst[j] = src1[j] + src2[j];
-        }
+        // Residual Add 2: x = x + mlp_out
+        tensor_add(x, mlp_out);
     } // End Layers Loop
 
     // 3. Final Norm
     auto final_norm = Tensor::create(x->shape(), dtype, LLAISYS_DEVICE_CPU);
     ops::rms_norm(final_norm, x, model->get_tensor(w.out_norm_w), meta.epsilon);
 
-    // 4. LM Head (只需要最后一个 token)
-    // Slice last row: [1, hidden]
+    // 4. LM Head
+    // 只取最后一个 token: [1, hidden]
     auto last_hidden = final_norm->slice(0, ntoken - 1, ntoken);
     auto logits = Tensor::create({1, meta.voc}, dtype, LLAISYS_DEVICE_CPU);
-    ops::linear(logits, last_hidden, model->get_tensor(w.out_embed), nullptr); // lm_head weight 通常复用或独立，Qwen2 独立？需检查 keys
-    // 注意：DeepSeek/Qwen 的 lm_head 通常不共享 embedding，需确认 load 逻辑
+    ops::linear(logits, last_hidden, model->get_tensor(w.out_embed), nullptr);
     
     // 5. Argmax
     auto max_val = Tensor::create({1}, dtype, LLAISYS_DEVICE_CPU);
@@ -240,4 +244,4 @@ int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token_ids, siz
     return next_token;
 }
 
-}
+} // extern "C"
