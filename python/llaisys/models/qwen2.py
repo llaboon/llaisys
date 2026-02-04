@@ -1,233 +1,263 @@
-from typing import Sequence
-import json
-import numpy as np
-import ctypes
-from pathlib import Path
-import struct
+#include "llaisys/models/qwen2.h"
+#include "llaisys/tensor.h"
 
-from ..libllaisys import LIB_LLAISYS, DeviceType
-from ..libllaisys.models.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
-from .. import Tensor
+// =====================================================
+// 【关键修复 1】必须包含 Tensor 类的定义
+// =====================================================
+#include "../tensor/tensor.hpp"
 
-# ======================================================================
-# 关键修复：修正数据类型枚举值
-# C++ 端通常定义 0 为 Invalid/Unknown，有效类型从 1 开始
-# ======================================================================
-LLAISYS_DTYPE_F32 = 1
-LLAISYS_DTYPE_F16 = 2
-LLAISYS_DTYPE_BF16 = 3
-LLAISYS_DTYPE_I8 = 4
-LLAISYS_DTYPE_I32 = 5
-LLAISYS_DTYPE_I64 = 6 
+#include <vector>
+#include <iostream>
+#include <cstring>
+#include <cmath>
+#include <algorithm>
+#include <memory> 
+#include <cstddef> // 【关键】for std::byte
 
-def numpy_to_tensor(np_data):
-    """
-    手动将 Numpy 数组转换为 LLAISYS Tensor
-    """
-    # 1. 确定数据类型映射
-    if np_data.dtype == np.float32:
-        dtype = LLAISYS_DTYPE_F32
-    elif np_data.dtype == np.float16:
-        dtype = LLAISYS_DTYPE_F16
-    elif np_data.dtype == np.uint16: 
-        dtype = LLAISYS_DTYPE_BF16
-    elif np_data.dtype == np.int64:
-        dtype = LLAISYS_DTYPE_I64
-    elif np_data.dtype == np.int32:
-        dtype = LLAISYS_DTYPE_I32
-    else:
-        print(f"Warning: mapping unknown dtype {np_data.dtype} to F32")
-        dtype = LLAISYS_DTYPE_F32
+// =====================================================
+// 【关键修复 2】补充 tensor_t 定义
+// =====================================================
+namespace llaisys {
+    // 确保 tensor_t 被正确定义为 Tensor 的智能指针
+    using tensor_t = std::shared_ptr<Tensor>;
+}
 
-    # 2. 获取形状
-    shape = list(np_data.shape)
+using namespace llaisys;
+
+// =====================================================
+// 【关键修复 3】宏定义 (防止链接时符号不可见)
+// =====================================================
+#ifndef LLAISYS_EXPORT
+    #if defined(_WIN32)
+        #define LLAISYS_EXPORT __declspec(dllexport)
+    #else
+        #define LLAISYS_EXPORT __attribute__((visibility("default")))
+    #endif
+#endif
+
+// =====================================================
+// 算子声明
+// =====================================================
+namespace llaisys::ops {
+    void embedding(tensor_t out, tensor_t index, tensor_t weight);
+    void rms_norm(tensor_t out, tensor_t in, tensor_t weight, float eps);
+    void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias);
+    void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta);
+    void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale);
+    void swiglu(tensor_t out, tensor_t gate, tensor_t up);
+    void argmax(tensor_t max_idx, tensor_t max_val, tensor_t vals);
+}
+
+// =====================================================
+// 辅助函数
+// =====================================================
+void tensor_add(tensor_t dst, tensor_t src) {
+    if (dst->numel() != src->numel()) return;
     
-    # 3. 创建 Tensor (确保传递 DeviceType 的整数值)
-    # 获取 device 的整数值 (如果 DeviceType 是 Enum)
-    device_val = DeviceType.CPU.value if hasattr(DeviceType.CPU, 'value') else DeviceType.CPU
+    // 假设都是 FP32 (Python端已处理BF16转FP32)
+    if (dst->dtype() == LLAISYS_DTYPE_F32) {
+        float* d = (float*)dst->data();
+        float* s = (float*)src->data();
+        for(size_t i=0; i<dst->numel(); ++i) d[i] += s[i];
+    }
+}
 
-    try:
-        # 尝试方式 A: 静态工厂方法
-        tensor = Tensor.create(shape, dtype, device_val)
-    except AttributeError:
-        try:
-            # 尝试方式 B: 构造函数
-            tensor = Tensor(shape, dtype, device_val)
-        except TypeError:
-            # 尝试方式 C: 也许不需要 device 参数
-            tensor = Tensor(shape, dtype)
-
-    # 4. 复制数据
-    # 确保 numpy 数组是连续内存
-    if not np_data.flags['C_CONTIGUOUS']:
-        np_data = np.ascontiguousarray(np_data)
-
-    src_ptr = np_data.ctypes.data_as(ctypes.c_void_p)
+// =====================================================
+// Qwen2 模型类
+// =====================================================
+struct LlaisysQwen2Model {
+    LlaisysQwen2Meta meta;
+    LlaisysQwen2Weights weights;
     
-    # 尝试调用 load 方法
-    if hasattr(tensor, 'load'):
-        tensor.load(src_ptr)
-    else:
-        # 兜底：如果 Tensor 没有 load 方法，尝试使用 libllaisys 直接加载
-        # 这里假设有一个通用的加载函数，如果还是报错，需要检查 Tensor 类的源码
-        pass
+    std::vector<tensor_t> k_cache;
+    std::vector<tensor_t> v_cache;
+    
+    int64_t current_pos = 0;
+    
+    LlaisysQwen2Model(const LlaisysQwen2Meta *m) : meta(*m) {
+        // 使用 () 初始化数组，确保指针被清零
+        weights.attn_norm_w = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_q_w = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_q_b = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_k_w = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_k_b = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_v_w = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_v_b = new llaisysTensor_t[meta.nlayer]();
+        weights.attn_o_w = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_norm_w = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_gate_w = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_up_w = new llaisysTensor_t[meta.nlayer]();
+        weights.mlp_down_w = new llaisysTensor_t[meta.nlayer]();
+    }
+
+    ~LlaisysQwen2Model() {
+        delete[] weights.attn_norm_w;
+        delete[] weights.attn_q_w; delete[] weights.attn_q_b;
+        delete[] weights.attn_k_w; delete[] weights.attn_k_b;
+        delete[] weights.attn_v_w; delete[] weights.attn_v_b;
+        delete[] weights.attn_o_w;
+        delete[] weights.mlp_norm_w;
+        delete[] weights.mlp_gate_w;
+        delete[] weights.mlp_up_w;
+        delete[] weights.mlp_down_w;
         
-    return tensor
+        k_cache.clear();
+        v_cache.clear();
+    }
+    
+    tensor_t get_tensor(llaisysTensor_t t) {
+        if (!t) return nullptr;
+        return *reinterpret_cast<tensor_t*>(t);
+    }
+};
 
-class Qwen2:
+// =====================================================
+// C API 实现
+// =====================================================
 
-    def __init__(self, model_path, device: DeviceType = DeviceType.CPU):
-        model_path = Path(model_path)
-        
-        # 1. Load Config
-        config_path = model_path / "config.json"
-        if not config_path.exists():
-            raise FileNotFoundError(f"Config not found at {config_path}")
+LLAISYS_EXPORT LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice) {
+    return new LlaisysQwen2Model(meta);
+}
 
-        with open(config_path, "r") as f:
-            cfg = json.load(f)
+LLAISYS_EXPORT void llaisysQwen2ModelDestroy(LlaisysQwen2Model *model) {
+    if (model) delete model;
+}
+
+LLAISYS_EXPORT LlaisysQwen2Weights *llaisysQwen2ModelWeights(LlaisysQwen2Model *model) {
+    return &model->weights;
+}
+
+LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
+    auto &meta = model->meta;
+    auto &w = model->weights;
+    
+    llaisysDataType_t compute_dtype = LLAISYS_DTYPE_F32; 
+
+    // 0. 输入 Tensor
+    // 【修复】(long) -> (size_t) 消除窄化警告
+    auto input = Tensor::create({(size_t)ntoken}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU);
+    input->load(token_ids); 
+
+    // 1. 初始化 KV Cache
+    if (model->k_cache.empty()) {
+        for(size_t i=0; i<meta.nlayer; ++i) {
+            // 【修复】所有维度使用 (size_t)
+            auto k_c = Tensor::create({(size_t)meta.maxseq, (size_t)meta.nkvh, (size_t)meta.dh}, compute_dtype, LLAISYS_DEVICE_CPU);
+            auto v_c = Tensor::create({(size_t)meta.maxseq, (size_t)meta.nkvh, (size_t)meta.dh}, compute_dtype, LLAISYS_DEVICE_CPU);
             
-        self.meta = LlaisysQwen2Meta()
-        self.meta.nlayer = cfg["num_hidden_layers"]
-        self.meta.hs = cfg["hidden_size"]
-        self.meta.nh = cfg["num_attention_heads"]
-        self.meta.nkvh = cfg["num_key_value_heads"]
-        self.meta.dh = self.meta.hs // self.meta.nh
-        self.meta.di = cfg["intermediate_size"]
-        self.meta.maxseq = 2048
-        self.meta.voc = cfg["vocab_size"]
-        self.meta.epsilon = cfg["rms_norm_eps"]
-        self.meta.theta = cfg.get("rope_theta", 10000.0)
-        self.meta.end_token = 151643 
-        self.meta.dtype = LLAISYS_DTYPE_F32 
-        
-        # 2. Create Model
-        self.model_ptr = LIB_LLAISYS.llaisysQwen2ModelCreate(
-            ctypes.byref(self.meta), 
-            device.value, None, 0
-        )
-        
-        # 3. Get Weights Pointer
-        self.weights_ptr = LIB_LLAISYS.llaisysQwen2ModelWeights(self.model_ptr)
-        self.weights = self.weights_ptr.contents
-        
-        self.tensors = []
-
-        # 4. Load Weights
-        print("Loading weights...")
-        safetensor_files = sorted(model_path.glob("*.safetensors"))
-        if not safetensor_files:
-            raise FileNotFoundError(f"No .safetensors files found in {model_path}")
-
-        for file in safetensor_files:
-            with open(file, "rb") as f_r:
-                header_len_bytes = f_r.read(8)
-                header_len = struct.unpack('<Q', header_len_bytes)[0]
-                
-                header_json_bytes = f_r.read(header_len)
-                header = json.loads(header_json_bytes)
-                
-                data_section_start = 8 + header_len
-                
-                for name, meta in header.items():
-                    if name == "__metadata__": continue
-                    
-                    dtype_str = meta['dtype']
-                    shape = meta['shape']
-                    start_offset, end_offset = meta['data_offsets']
-                    
-                    f_r.seek(data_section_start + start_offset)
-                    length = end_offset - start_offset
-                    raw_bytes = f_r.read(length)
-                    
-                    # --- 核心：BF16 -> FP32 转换 ---
-                    # 这样可以避免 C++ 端读取 BF16 导致的内存越界
-                    if dtype_str == "BF16" or dtype_str == "bfloat16":
-                        # 1. 读取为 uint16
-                        np_uint16 = np.frombuffer(raw_bytes, dtype=np.uint16)
-                        # 2. 左移 16 位填充到 uint32 高位
-                        np_uint32 = np_uint16.astype(np.uint32) << 16
-                        # 3. 解释为 float32
-                        np_data = np_uint32.view(np.float32)
-                    # ----------------------------------
-                    elif dtype_str == "F32" or dtype_str == "float32":
-                        np_data = np.frombuffer(raw_bytes, dtype=np.float32)
-                    elif dtype_str == "F16" or dtype_str == "float16":
-                        np_data = np.frombuffer(raw_bytes, dtype=np.float16)
-                    elif dtype_str == "I64" or dtype_str == "int64":
-                         np_data = np.frombuffer(raw_bytes, dtype=np.int64)
-                    else:
-                        print(f"Warning: Unknown dtype {dtype_str}, treating as F32")
-                        np_data = np.frombuffer(raw_bytes, dtype=np.float32)
-                    
-                    np_data = np_data.reshape(shape)
-
-                    # 转换为 LLAISYS Tensor
-                    tensor = numpy_to_tensor(np_data)
-                    self.tensors.append(tensor)
-                    lib_tensor = tensor.lib_tensor()
-
-                    # Map name to C struct
-                    if name == "model.embed_tokens.weight":
-                        self.weights.in_embed = lib_tensor
-                    elif name == "lm_head.weight":
-                        self.weights.out_embed = lib_tensor
-                    elif name == "model.norm.weight":
-                        self.weights.out_norm_w = lib_tensor
-                    elif name.startswith("model.layers."):
-                        parts = name.split(".")
-                        idx = int(parts[2]) 
-                        layer_type = parts[3] 
-                        
-                        if name.endswith(".weight"):
-                            if layer_type == "input_layernorm":
-                                self.weights.attn_norm_w[idx] = lib_tensor
-                            elif layer_type == "post_attention_layernorm":
-                                self.weights.mlp_norm_w[idx] = lib_tensor
-                            elif layer_type == "self_attn":
-                                proj = parts[4] 
-                                if "q_proj" in proj: self.weights.attn_q_w[idx] = lib_tensor
-                                elif "k_proj" in proj: self.weights.attn_k_w[idx] = lib_tensor
-                                elif "v_proj" in proj: self.weights.attn_v_w[idx] = lib_tensor
-                                elif "o_proj" in proj: self.weights.attn_o_w[idx] = lib_tensor
-                            elif layer_type == "mlp":
-                                proj = parts[4]
-                                if "gate_proj" in proj: self.weights.mlp_gate_w[idx] = lib_tensor
-                                elif "up_proj" in proj: self.weights.mlp_up_w[idx] = lib_tensor
-                                elif "down_proj" in proj: self.weights.mlp_down_w[idx] = lib_tensor
-
-    def __del__(self):
-        if hasattr(self, "model_ptr") and self.model_ptr:
-            LIB_LLAISYS.llaisysQwen2ModelDestroy(self.model_ptr)
-
-    def generate(
-        self,
-        inputs: Sequence[int],
-        max_new_tokens: int = 100,
-        top_k: int = 1, 
-        top_p: float = 0.8,
-        temperature: float = 0.8,
-    ):
-        current_ids = list(inputs)
-        new_tokens = []
-        
-        input_array = (ctypes.c_int64 * len(current_ids))(*current_ids)
-        next_token = LIB_LLAISYS.llaisysQwen2ModelInfer(
-            self.model_ptr, input_array, len(current_ids)
-        )
-        
-        current_ids.append(next_token)
-        new_tokens.append(next_token)
-        
-        for _ in range(max_new_tokens - 1):
-            if next_token == self.meta.end_token:
-                break
-                
-            input_array = (ctypes.c_int64 * 1)(*[next_token])
-            next_token = LIB_LLAISYS.llaisysQwen2ModelInfer(
-                self.model_ptr, input_array, 1
-            )
+            // 手动计算字节并清零
+            size_t cache_bytes = k_c->numel() * sizeof(float);
+            std::memset(k_c->data(), 0, cache_bytes);
+            std::memset(v_c->data(), 0, cache_bytes);
             
-            new_tokens.append(next_token)
-            
-        return new_tokens
+            model->k_cache.push_back(k_c);
+            model->v_cache.push_back(v_c);
+        }
+    }
+
+    // 2. Embedding
+    auto x = Tensor::create({(size_t)ntoken, (size_t)meta.hs}, compute_dtype, LLAISYS_DEVICE_CPU);
+    if (w.in_embed) {
+        ops::embedding(x, input, model->get_tensor(w.in_embed));
+    }
+
+    // 3. Layers Loop
+    for (size_t i = 0; i < meta.nlayer; ++i) {
+        auto residual = Tensor::create(x->shape(), compute_dtype, LLAISYS_DEVICE_CPU);
+        std::memcpy(residual->data(), x->data(), x->numel() * sizeof(float)); 
+
+        // --- Attention ---
+        auto norm_out = Tensor::create(x->shape(), compute_dtype, LLAISYS_DEVICE_CPU);
+        ops::rms_norm(norm_out, x, model->get_tensor(w.attn_norm_w[i]), meta.epsilon);
+        
+        // 【修复】维度使用 (size_t)
+        auto q = Tensor::create({(size_t)ntoken, (size_t)meta.nh, (size_t)meta.dh}, compute_dtype, LLAISYS_DEVICE_CPU);
+        auto k = Tensor::create({(size_t)ntoken, (size_t)meta.nkvh, (size_t)meta.dh}, compute_dtype, LLAISYS_DEVICE_CPU);
+        auto v = Tensor::create({(size_t)ntoken, (size_t)meta.nkvh, (size_t)meta.dh}, compute_dtype, LLAISYS_DEVICE_CPU);
+        
+        // 【修复】使用 (size_t) 强转乘积结果
+        auto q_view = q->view({(size_t)ntoken, (size_t)(meta.nh * meta.dh)});
+        auto k_view = k->view({(size_t)ntoken, (size_t)(meta.nkvh * meta.dh)});
+        auto v_view = v->view({(size_t)ntoken, (size_t)(meta.nkvh * meta.dh)});
+        
+        // 【关键】Bias 传 nullptr，防止段错误
+        ops::linear(q_view, norm_out, model->get_tensor(w.attn_q_w[i]), nullptr);
+        ops::linear(k_view, norm_out, model->get_tensor(w.attn_k_w[i]), nullptr);
+        ops::linear(v_view, norm_out, model->get_tensor(w.attn_v_w[i]), nullptr);
+
+        // RoPE
+        auto pos_ids = Tensor::create({(size_t)ntoken}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU);
+        std::vector<int64_t> pos_vec(ntoken);
+        for(size_t p=0; p<ntoken; ++p) pos_vec[p] = model->current_pos + p;
+        pos_ids->load(pos_vec.data());
+
+        ops::rope(q, q, pos_ids, meta.theta);
+        ops::rope(k, k, pos_ids, meta.theta);
+
+        // Update Cache
+        size_t head_dim_bytes = meta.dh * sizeof(float);
+        size_t kv_len_bytes = ntoken * meta.nkvh * head_dim_bytes;
+        size_t offset_bytes = model->current_pos * meta.nkvh * head_dim_bytes;
+        
+        // 【修复】解决 signed/unsigned 比较警告
+        if ((size_t)model->current_pos < meta.maxseq) {
+             std::byte* k_cache_ptr = (std::byte*)model->k_cache[i]->data();
+             std::byte* v_cache_ptr = (std::byte*)model->v_cache[i]->data();
+             std::memcpy(k_cache_ptr + offset_bytes, k->data(), kv_len_bytes);
+             std::memcpy(v_cache_ptr + offset_bytes, v->data(), kv_len_bytes);
+        }
+
+        size_t total_seq_len = model->current_pos + ntoken;
+        
+        auto k_full = model->k_cache[i]->slice(0, 0, (size_t)total_seq_len);
+        auto v_full = model->v_cache[i]->slice(0, 0, (size_t)total_seq_len);
+
+        auto attn_out = Tensor::create({(size_t)ntoken, (size_t)meta.nh, (size_t)meta.dh}, compute_dtype, LLAISYS_DEVICE_CPU);
+        float scale = 1.0f / sqrtf((float)meta.dh);
+        
+        ops::self_attention(attn_out, q, k_full, v_full, scale);
+
+        auto attn_out_view = attn_out->view({(size_t)ntoken, (size_t)(meta.nh * meta.dh)});
+        ops::linear(x, attn_out_view, model->get_tensor(w.attn_o_w[i]), nullptr);
+        
+        tensor_add(x, residual);
+        std::memcpy(residual->data(), x->data(), x->numel() * sizeof(float)); 
+
+        // --- MLP ---
+        ops::rms_norm(norm_out, x, model->get_tensor(w.mlp_norm_w[i]), meta.epsilon);
+        
+        auto gate = Tensor::create({(size_t)ntoken, (size_t)meta.di}, compute_dtype, LLAISYS_DEVICE_CPU);
+        auto up = Tensor::create({(size_t)ntoken, (size_t)meta.di}, compute_dtype, LLAISYS_DEVICE_CPU);
+        
+        ops::linear(gate, norm_out, model->get_tensor(w.mlp_gate_w[i]), nullptr);
+        ops::linear(up, norm_out, model->get_tensor(w.mlp_up_w[i]), nullptr);
+        
+        ops::swiglu(gate, gate, up);
+        
+        ops::linear(x, gate, model->get_tensor(w.mlp_down_w[i]), nullptr);
+        
+        tensor_add(x, residual);
+    }
+
+    // 4. Final Norm
+    auto final_norm = Tensor::create(x->shape(), compute_dtype, LLAISYS_DEVICE_CPU);
+    ops::rms_norm(final_norm, x, model->get_tensor(w.out_norm_w), meta.epsilon);
+
+    // 5. Logits
+    auto last_hidden = final_norm->slice(0, (size_t)ntoken - 1, (size_t)ntoken); 
+    auto logits = Tensor::create({1, (size_t)meta.voc}, compute_dtype, LLAISYS_DEVICE_CPU);
+    
+    ops::linear(logits, last_hidden, model->get_tensor(w.out_embed), nullptr);
+
+    // 6. Argmax
+    auto max_val = Tensor::create({1}, compute_dtype, LLAISYS_DEVICE_CPU);
+    auto max_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU);
+    
+    ops::argmax(max_idx, max_val, logits);
+    
+    int64_t next_token = ((int64_t*)max_idx->data())[0];
+    
+    model->current_pos += ntoken;
+
+    return next_token;
+}
