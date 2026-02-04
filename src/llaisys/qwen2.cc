@@ -105,9 +105,13 @@ struct LlaisysQwen2Model {
         v_cache.clear();
     }
     
+    // 【核心修复】正确地从原始指针构造 shared_ptr (不接管所有权)
     tensor_t get_tensor(llaisysTensor_t t) {
         if (!t) return nullptr;
-        return *reinterpret_cast<tensor_t*>(t);
+        // t 是 Tensor* (raw pointer)
+        // 我们创建一个 shared_ptr 指向它，但指定一个空的 deleter [](Tensor*){}
+        // 这样当 shared_ptr 销毁时，不会 delete 掉 Python 端的对象
+        return std::shared_ptr<Tensor>(reinterpret_cast<Tensor*>(t), [](Tensor*){});
     }
 };
 
@@ -179,7 +183,7 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
         auto k_view = k->view({(size_t)ntoken, (size_t)(meta.nkvh * meta.dh)});
         auto v_view = v->view({(size_t)ntoken, (size_t)(meta.nkvh * meta.dh)});
         
-        // 【关键】Bias 传 nullptr
+        // 【关键】Bias 传 nullptr，防止段错误
         ops::linear(q_view, norm_out, model->get_tensor(w.attn_q_w[i]), nullptr);
         ops::linear(k_view, norm_out, model->get_tensor(w.attn_k_w[i]), nullptr);
         ops::linear(v_view, norm_out, model->get_tensor(w.attn_v_w[i]), nullptr);
