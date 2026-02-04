@@ -2,7 +2,7 @@
 #include "llaisys/tensor.h"
 
 // =====================================================
-// 【关键修复 1】必须包含 Tensor 类的定义
+// 
 // =====================================================
 #include "../tensor/tensor.hpp"
 
@@ -12,10 +12,10 @@
 #include <cmath>
 #include <algorithm>
 #include <memory> 
-#include <cstddef> // 【关键】for std::byte
+#include <cstddef> // 
 
 // =====================================================
-// 【关键修复 2】补充 tensor_t 定义
+// 
 // =====================================================
 namespace llaisys {
     // 确保 tensor_t 被正确定义为 Tensor 的智能指针
@@ -25,7 +25,7 @@ namespace llaisys {
 using namespace llaisys;
 
 // =====================================================
-// 【关键修复 3】宏定义 (防止链接时符号不可见)
+// 
 // =====================================================
 #ifndef LLAISYS_EXPORT
     #if defined(_WIN32)
@@ -180,7 +180,7 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
         auto k_view = k->view({(size_t)ntoken, (size_t)(meta.nkvh * meta.dh)});
         auto v_view = v->view({(size_t)ntoken, (size_t)(meta.nkvh * meta.dh)});
         
-        // 【关键】Bias 传 nullptr，防止段错误
+        // 
         ops::linear(q_view, norm_out, model->get_tensor(w.attn_q_w[i]), nullptr);
         ops::linear(k_view, norm_out, model->get_tensor(w.attn_k_w[i]), nullptr);
         ops::linear(v_view, norm_out, model->get_tensor(w.attn_v_w[i]), nullptr);
@@ -199,7 +199,7 @@ LLAISYS_EXPORT int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t 
         size_t kv_len_bytes = ntoken * meta.nkvh * head_dim_bytes;
         size_t offset_bytes = model->current_pos * meta.nkvh * head_dim_bytes;
         
-        // 【修复】解决 signed/unsigned 比较警告
+        // 
         if ((size_t)model->current_pos < meta.maxseq) {
              std::byte* k_cache_ptr = (std::byte*)model->k_cache[i]->data();
              std::byte* v_cache_ptr = (std::byte*)model->v_cache[i]->data();
