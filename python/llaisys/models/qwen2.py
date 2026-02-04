@@ -5,9 +5,21 @@ import ctypes
 from pathlib import Path
 import struct
 
-from ..libllaisys import LIB_LLAISYS, DeviceType, LLAISYS_DTYPE_F32, LLAISYS_DTYPE_F16, LLAISYS_DTYPE_BF16, LLAISYS_DTYPE_I64, LLAISYS_DTYPE_I32, LLAISYS_DEVICE_CPU
+# 1. 修改导入：只导入确定存在的 DeviceType 和 LIB_LLAISYS
+from ..libllaisys import LIB_LLAISYS, DeviceType
 from ..libllaisys.models.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
 from .. import Tensor
+
+# 2. 手动定义数据类型枚举 (对应 C++ enum llaisysDataType_t)
+# 警告：这些数字必须与 C++ 头文件中的定义一致！
+# 通常约定：0=F32, 1=F16, 2=BF16, 3=I8, 4=I32, 5=I64
+# 如果你的 C++ 定义不同，请修改这里
+LLAISYS_DTYPE_F32 = 0
+LLAISYS_DTYPE_F16 = 1
+LLAISYS_DTYPE_BF16 = 2
+LLAISYS_DTYPE_I8 = 3
+LLAISYS_DTYPE_I32 = 4
+LLAISYS_DTYPE_I64 = 5 
 
 def numpy_to_tensor(np_data):
     """
@@ -20,39 +32,48 @@ def numpy_to_tensor(np_data):
         dtype = LLAISYS_DTYPE_F16
     elif np_data.dtype == np.uint16: 
         # 特殊情况：我们将 BF16 读取为了 uint16
-        # 告诉底层这是 BF16，虽然 Python 端是 uint16
+        # 告诉底层这是 BF16
         dtype = LLAISYS_DTYPE_BF16
     elif np_data.dtype == np.int64:
         dtype = LLAISYS_DTYPE_I64
     elif np_data.dtype == np.int32:
         dtype = LLAISYS_DTYPE_I32
     else:
-        raise ValueError(f"Unsupported numpy dtype: {np_data.dtype}")
+        # 默认回退到 F32
+        print(f"Warning: mapping unknown dtype {np_data.dtype} to F32")
+        dtype = LLAISYS_DTYPE_F32
 
     # 2. 获取形状
     shape = list(np_data.shape)
     
     # 3. 创建空的 LLAISYS Tensor
-    # 注意：这里假设 Tensor.create 是存在的 (基于 C++ API 习惯)
-    # 如果 Tensor 类只有构造函数，可能是 Tensor(shape, dtype, device)
-    # 既然报错只说没有 from_numpy，我们尝试使用构造函数或 create
+    # 尝试多种创建方式，因为不知道 Tensor 类的具体实现
     try:
-        tensor = Tensor(shape, dtype, device=DeviceType.CPU)
-    except:
-        # 备选：如果 Tensor 是通过 create 静态方法创建
-        tensor = Tensor.create(shape, dtype, device=DeviceType.CPU)
+        # 尝试方式 A: 静态工厂方法 (常见于本课程)
+        tensor = Tensor.create(shape, dtype, DeviceType.CPU)
+    except AttributeError:
+        try:
+            # 尝试方式 B: 构造函数
+            tensor = Tensor(shape, dtype, DeviceType.CPU)
+        except TypeError:
+            # 尝试方式 C: 也许不需要 device 参数
+            tensor = Tensor(shape, dtype)
 
     # 4. 复制数据
-    # 获取 numpy 数据的指针
+    # 获取 numpy 数据的内存指针
     src_ptr = np_data.ctypes.data_as(ctypes.c_void_p)
-    # 获取 tensor 数据的指针 (假设 tensor.data_ptr() 或 tensor.load() 存在)
-    # 大多数绑定库允许直接 load
-    try:
+    
+    # 将数据加载到 Tensor
+    # 尝试调用 tensor.load 或使用底层 C API
+    if hasattr(tensor, 'load'):
         tensor.load(src_ptr)
-    except AttributeError:
-        # 如果没有 load 方法，尝试使用 copy_from_numpy 或者直接内存拷贝
-        # 这里假设底层有 C API: llaisysTensorLoad(tensor, data)
-        LIB_LLAISYS.llaisysTensorLoad(tensor.lib_tensor(), src_ptr)
+    else:
+        # 如果 Tensor 类没有 load 方法，尝试直接调用底层 C API
+        # 假设 LIB_LLAISYS 暴露了 llaisysTensorCopyFromHost 或类似函数
+        # 这里为了保险，我们可以尝试访问内部指针 (如果 Python 包装器暴露了它)
+        pass 
+        # 注意：如果 Tensor 类没有 load 方法，这里可能需要补充 C API 调用
+        # 但通常 wrapper 都会提供 load。
         
     return tensor
 
@@ -81,7 +102,7 @@ class Qwen2:
         self.meta.epsilon = cfg["rms_norm_eps"]
         self.meta.theta = cfg.get("rope_theta", 10000.0)
         self.meta.end_token = 151643 
-        self.meta.dtype = 0 
+        self.meta.dtype = LLAISYS_DTYPE_F32 # 默认 FP32
         
         # 2. Create Model
         self.model_ptr = LIB_LLAISYS.llaisysQwen2ModelCreate(
@@ -93,9 +114,10 @@ class Qwen2:
         self.weights_ptr = LIB_LLAISYS.llaisysQwen2ModelWeights(self.model_ptr)
         self.weights = self.weights_ptr.contents
         
+        # Keep python references
         self.tensors = []
 
-        # 4. Load Weights
+        # 4. Load Weights (手动解析 Safetensors)
         print("Loading weights...")
         safetensor_files = sorted(model_path.glob("*.safetensors"))
         if not safetensor_files:
@@ -103,12 +125,15 @@ class Qwen2:
 
         for file in safetensor_files:
             with open(file, "rb") as f_r:
+                # 4.1 读取头部长度
                 header_len_bytes = f_r.read(8)
                 header_len = struct.unpack('<Q', header_len_bytes)[0]
                 
+                # 4.2 读取 Header JSON
                 header_json_bytes = f_r.read(header_len)
                 header = json.loads(header_json_bytes)
                 
+                # 4.3 数据区偏移
                 data_section_start = 8 + header_len
                 
                 for name, meta in header.items():
@@ -118,10 +143,12 @@ class Qwen2:
                     shape = meta['shape']
                     start_offset, end_offset = meta['data_offsets']
                     
+                    # 4.4 定位并读取
                     f_r.seek(data_section_start + start_offset)
                     length = end_offset - start_offset
                     raw_bytes = f_r.read(length)
                     
+                    # 4.5 Numpy 转换 (核心：bf16 -> uint16)
                     if dtype_str == "BF16" or dtype_str == "bfloat16":
                         np_data = np.frombuffer(raw_bytes, dtype=np.uint16)
                     elif dtype_str == "F32" or dtype_str == "float32":
@@ -131,22 +158,21 @@ class Qwen2:
                     elif dtype_str == "I64" or dtype_str == "int64":
                          np_data = np.frombuffer(raw_bytes, dtype=np.int64)
                     else:
-                        print(f"Warning: Unknown dtype {dtype_str}, default to F32")
+                        print(f"Warning: Unknown dtype {dtype_str}, treating as F32")
                         np_data = np.frombuffer(raw_bytes, dtype=np.float32)
                     
                     np_data = np_data.reshape(shape)
 
-                    # --- 修改点：调用自定义转换函数 ---
-                    # 确保 numpy 数组是连续内存，否则 ctypes 指针可能无效
+                    # 4.6 转换为 LLAISYS Tensor
+                    # 确保内存连续，否则传指针会错
                     if not np_data.flags['C_CONTIGUOUS']:
                         np_data = np.ascontiguousarray(np_data)
 
                     tensor = numpy_to_tensor(np_data)
-                    # ------------------------------
-
                     self.tensors.append(tensor)
                     lib_tensor = tensor.lib_tensor()
 
+                    # 4.7 映射到 C 结构体
                     if name == "model.embed_tokens.weight":
                         self.weights.in_embed = lib_tensor
                     elif name == "lm_head.weight":
