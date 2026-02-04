@@ -5,10 +5,56 @@ import ctypes
 from pathlib import Path
 import struct
 
-# 注意：我们这里不需要 import safetensors.numpy 了，因为我们将手动解析
-from ..libllaisys import LIB_LLAISYS, DeviceType
+from ..libllaisys import LIB_LLAISYS, DeviceType, LLAISYS_DTYPE_F32, LLAISYS_DTYPE_F16, LLAISYS_DTYPE_BF16, LLAISYS_DTYPE_I64, LLAISYS_DTYPE_I32, LLAISYS_DEVICE_CPU
 from ..libllaisys.models.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
 from .. import Tensor
+
+def numpy_to_tensor(np_data):
+    """
+    手动将 Numpy 数组转换为 LLAISYS Tensor
+    """
+    # 1. 确定数据类型映射
+    if np_data.dtype == np.float32:
+        dtype = LLAISYS_DTYPE_F32
+    elif np_data.dtype == np.float16:
+        dtype = LLAISYS_DTYPE_F16
+    elif np_data.dtype == np.uint16: 
+        # 特殊情况：我们将 BF16 读取为了 uint16
+        # 告诉底层这是 BF16，虽然 Python 端是 uint16
+        dtype = LLAISYS_DTYPE_BF16
+    elif np_data.dtype == np.int64:
+        dtype = LLAISYS_DTYPE_I64
+    elif np_data.dtype == np.int32:
+        dtype = LLAISYS_DTYPE_I32
+    else:
+        raise ValueError(f"Unsupported numpy dtype: {np_data.dtype}")
+
+    # 2. 获取形状
+    shape = list(np_data.shape)
+    
+    # 3. 创建空的 LLAISYS Tensor
+    # 注意：这里假设 Tensor.create 是存在的 (基于 C++ API 习惯)
+    # 如果 Tensor 类只有构造函数，可能是 Tensor(shape, dtype, device)
+    # 既然报错只说没有 from_numpy，我们尝试使用构造函数或 create
+    try:
+        tensor = Tensor(shape, dtype, device=DeviceType.CPU)
+    except:
+        # 备选：如果 Tensor 是通过 create 静态方法创建
+        tensor = Tensor.create(shape, dtype, device=DeviceType.CPU)
+
+    # 4. 复制数据
+    # 获取 numpy 数据的指针
+    src_ptr = np_data.ctypes.data_as(ctypes.c_void_p)
+    # 获取 tensor 数据的指针 (假设 tensor.data_ptr() 或 tensor.load() 存在)
+    # 大多数绑定库允许直接 load
+    try:
+        tensor.load(src_ptr)
+    except AttributeError:
+        # 如果没有 load 方法，尝试使用 copy_from_numpy 或者直接内存拷贝
+        # 这里假设底层有 C API: llaisysTensorLoad(tensor, data)
+        LIB_LLAISYS.llaisysTensorLoad(tensor.lib_tensor(), src_ptr)
+        
+    return tensor
 
 class Qwen2:
 
@@ -35,7 +81,7 @@ class Qwen2:
         self.meta.epsilon = cfg["rms_norm_eps"]
         self.meta.theta = cfg.get("rope_theta", 10000.0)
         self.meta.end_token = 151643 
-        self.meta.dtype = 0 # 假设 0=FP32 (虽然数据是BF16，但在C++里会转)
+        self.meta.dtype = 0 
         
         # 2. Create Model
         self.model_ptr = LIB_LLAISYS.llaisysQwen2ModelCreate(
@@ -47,10 +93,9 @@ class Qwen2:
         self.weights_ptr = LIB_LLAISYS.llaisysQwen2ModelWeights(self.model_ptr)
         self.weights = self.weights_ptr.contents
         
-        # Keep python references to tensors to prevent GC
         self.tensors = []
 
-        # 4. Load Weights (手动解析 Safetensors，绕过版本兼容性问题)
+        # 4. Load Weights
         print("Loading weights...")
         safetensor_files = sorted(model_path.glob("*.safetensors"))
         if not safetensor_files:
@@ -58,35 +103,25 @@ class Qwen2:
 
         for file in safetensor_files:
             with open(file, "rb") as f_r:
-                # 4.1 读取头部长度 (8字节, uint64, 小端序)
                 header_len_bytes = f_r.read(8)
                 header_len = struct.unpack('<Q', header_len_bytes)[0]
                 
-                # 4.2 读取 Header JSON
                 header_json_bytes = f_r.read(header_len)
                 header = json.loads(header_json_bytes)
                 
-                # 4.3 计算数据区的绝对起始偏移量
                 data_section_start = 8 + header_len
                 
-                # 4.4 遍历 Header 中的每个张量
                 for name, meta in header.items():
-                    # 跳过元数据键
                     if name == "__metadata__": continue
                     
                     dtype_str = meta['dtype']
                     shape = meta['shape']
                     start_offset, end_offset = meta['data_offsets']
                     
-                    # 4.5 定位到该张量的数据位置
                     f_r.seek(data_section_start + start_offset)
-                    
-                    # 4.6 读取原始字节
                     length = end_offset - start_offset
                     raw_bytes = f_r.read(length)
                     
-                    # 4.7 转换为 Numpy 数组 (核心解法)
-                    # 无论 Numpy 版本多旧，它都支持 uint16
                     if dtype_str == "BF16" or dtype_str == "bfloat16":
                         np_data = np.frombuffer(raw_bytes, dtype=np.uint16)
                     elif dtype_str == "F32" or dtype_str == "float32":
@@ -96,20 +131,22 @@ class Qwen2:
                     elif dtype_str == "I64" or dtype_str == "int64":
                          np_data = np.frombuffer(raw_bytes, dtype=np.int64)
                     else:
-                        print(f"Warning: Unknown dtype {dtype_str} for {name}, treating as float32")
+                        print(f"Warning: Unknown dtype {dtype_str}, default to F32")
                         np_data = np.frombuffer(raw_bytes, dtype=np.float32)
                     
-                    # 恢复形状
                     np_data = np_data.reshape(shape)
 
-                    # --- 后续逻辑保持不变 ---
-                    
-                    # Convert to LLAISYS Tensor
-                    tensor = Tensor.from_numpy(np_data) 
+                    # --- 修改点：调用自定义转换函数 ---
+                    # 确保 numpy 数组是连续内存，否则 ctypes 指针可能无效
+                    if not np_data.flags['C_CONTIGUOUS']:
+                        np_data = np.ascontiguousarray(np_data)
+
+                    tensor = numpy_to_tensor(np_data)
+                    # ------------------------------
+
                     self.tensors.append(tensor)
                     lib_tensor = tensor.lib_tensor()
 
-                    # Map name to C struct
                     if name == "model.embed_tokens.weight":
                         self.weights.in_embed = lib_tensor
                     elif name == "lm_head.weight":
@@ -121,7 +158,6 @@ class Qwen2:
                         idx = int(parts[2]) 
                         layer_type = parts[3] 
                         
-                        # 确保只加载 weight，不处理 bias (Qwen2 通常无 bias，防止同名覆盖)
                         if name.endswith(".weight"):
                             if layer_type == "input_layernorm":
                                 self.weights.attn_norm_w[idx] = lib_tensor
