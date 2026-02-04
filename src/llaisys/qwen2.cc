@@ -9,7 +9,13 @@
 #include <algorithm>
 
 using namespace llaisys;
-
+#ifndef LLAISYS_EXPORT
+    #if defined(_WIN32)
+        #define LLAISYS_EXPORT __declspec(dllexport)
+    #else
+        #define LLAISYS_EXPORT __attribute__((visibility("default")))
+    #endif
+#endif
 // =====================================================
 // 1. 工具函数：BF16 转 FP32
 // =====================================================
