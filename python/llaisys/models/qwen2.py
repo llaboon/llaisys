@@ -73,7 +73,8 @@ class Qwen2:
                         np_data = np_data.reshape(shape)
                     else:
                         # 对于 float32 等常规类型，直接读取
-                        np_data = f.get_tensor(name)
+                        np_data1 = f.get_tensor(name)
+                        np_data=np_data1
                     # ----------------------------
 
                     # Convert to LLAISYS Tensor
