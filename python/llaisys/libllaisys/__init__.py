@@ -2,7 +2,7 @@ import os
 import sys
 import ctypes
 from pathlib import Path
-
+from .models import LlaisysQwen2Meta, LlaisysQwen2Weights
 from .runtime import load_runtime
 from .runtime import LlaisysRuntimeAPI
 from .llaisys_types import llaisysDeviceType_t, DeviceType
