@@ -2,7 +2,7 @@ import os
 import sys
 import ctypes
 from pathlib import Path
-from .structs import LlaisysQwen2Meta, LlaisysQwen2Weights
+
 from .runtime import load_runtime
 from .runtime import LlaisysRuntimeAPI
 from .llaisys_types import llaisysDeviceType_t, DeviceType
@@ -39,6 +39,31 @@ load_runtime(LIB_LLAISYS)
 load_tensor(LIB_LLAISYS)
 load_ops(LIB_LLAISYS)
 
+# 1. Import Structs
+from .structs import LlaisysQwen2Meta, LlaisysQwen2Weights
+
+# 2. Bind Functions Here (Resolves Circular Import)
+LIB_LLAISYS.llaisysQwen2ModelCreate.argtypes = [
+    ctypes.POINTER(LlaisysQwen2Meta),
+    ctypes.c_int, # DeviceType
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_int
+]
+LIB_LLAISYS.llaisysQwen2ModelCreate.restype = ctypes.c_void_p
+
+LIB_LLAISYS.llaisysQwen2ModelDestroy.argtypes = [ctypes.c_void_p]
+LIB_LLAISYS.llaisysQwen2ModelDestroy.restype = None
+
+LIB_LLAISYS.llaisysQwen2ModelWeights.argtypes = [ctypes.c_void_p]
+LIB_LLAISYS.llaisysQwen2ModelWeights.restype = ctypes.POINTER(LlaisysQwen2Weights)
+
+LIB_LLAISYS.llaisysQwen2ModelInfer.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_int64),
+    ctypes.c_size_t
+]
+LIB_LLAISYS.llaisysQwen2ModelInfer.restype = ctypes.c_int64
+
 
 __all__ = [
     "LIB_LLAISYS",
@@ -52,6 +77,6 @@ __all__ = [
     "llaisysMemcpyKind_t",
     "MemcpyKind",
     "llaisysStream_t",
-    "LlaisysQwen2Meta",    
-    "LlaisysQwen2Weights" 
+    "LlaisysQwen2Meta",
+    "LlaisysQwen2Weights"
 ]
