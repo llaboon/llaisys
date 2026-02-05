@@ -7,10 +7,14 @@
 #include <algorithm>
 #include <iostream>
 
-// Forward declarations for internal C++ Ops
-// This avoids include path issues for internal headers
+// =========================================================================
+// Fix: Use the correct internal type for C++ Ops (Linker Name Matching)
+// The library likely implements ops using 'llaisys::Tensor' class, 
+// not the C-struct 'LlaisysTensor'.
+// =========================================================================
 namespace llaisys {
-    typedef struct LlaisysTensor *tensor_t; 
+    class Tensor; // Forward declare the internal C++ class
+    using tensor_t = Tensor*; 
     
     namespace ops {
         void embedding(tensor_t out, tensor_t index, tensor_t weight);
@@ -24,6 +28,8 @@ namespace llaisys {
     }
 }
 
+// Helper to cast C opaque handle (LlaisysTensor*) to internal C++ pointer (llaisys::Tensor*)
+// We assume they point to the same object instance.
 using InternalTensor = llaisys::tensor_t;
 inline InternalTensor cast(llaisysTensor_t t) { return reinterpret_cast<InternalTensor>(t); }
 
@@ -104,7 +110,6 @@ int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token
     if (ntoken == 0) return -1;
 
     // 1. Prepare Input Wrapper
-    // Fix: Use LLAISYS_DTYPE_I64 instead of LLAISYS_DTYPE_INT64
     size_t in_shape[] = {1, ntoken};
     llaisysTensor_t t_input = tensorCreate(in_shape, 2, LLAISYS_DTYPE_I64, model->device, model->device_id);
     tensorLoad(t_input, token_ids); 
@@ -191,7 +196,6 @@ int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token
     llaisys::ops::linear(cast(t_logits), cast(t_last), cast(model->exported.out_embed), nullptr);
 
     // Argmax
-    // Fix: Use LLAISYS_DTYPE_I64
     size_t out_shape[] = {1};
     llaisysTensor_t t_idx = tensorCreate(out_shape, 1, LLAISYS_DTYPE_I64, model->device, model->device_id);
     llaisysTensor_t t_val = tensorCreate(out_shape, 1, model->meta.dtype, model->device, model->device_id);
