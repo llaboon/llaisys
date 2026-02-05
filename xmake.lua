@@ -18,6 +18,11 @@ if has_config("nv-gpu") then
     includes("xmake/nvidia.lua")
 end
 
+-- [Helper Function] Prevent installation of static libs
+function no_install(target)
+    -- Do nothing on install
+end
+
 target("llaisys-utils")
     set_kind("static")
     set_languages("cxx17")
@@ -26,6 +31,7 @@ target("llaisys-utils")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
     add_files("src/utils/*.cpp")
+    on_install(no_install) -- CRITICAL FIX
 target_end()
 
 target("llaisys-device")
@@ -38,6 +44,7 @@ target("llaisys-device")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
     add_files("src/device/*.cpp")
+    on_install(no_install) -- CRITICAL FIX
 target_end()
 
 target("llaisys-core")
@@ -50,6 +57,7 @@ target("llaisys-core")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
     add_files("src/core/*/*.cpp")
+    on_install(no_install) -- CRITICAL FIX
 target_end()
 
 target("llaisys-tensor")
@@ -61,6 +69,7 @@ target("llaisys-tensor")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
     add_files("src/tensor/*.cpp")
+    on_install(no_install) -- CRITICAL FIX
 target_end()
 
 target("llaisys-ops")
@@ -72,9 +81,9 @@ target("llaisys-ops")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
     add_files("src/ops/*/*.cpp")
+    on_install(no_install) -- CRITICAL FIX
 target_end()
 
--- [Assignment 3: New Target for Models]
 target("llaisys-models")
     set_kind("static")
     add_deps("llaisys-tensor")
@@ -85,8 +94,8 @@ target("llaisys-models")
     if not is_plat("windows") then
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
-    -- Make sure your cpp file is in src/llaisys/models/qwen2.cpp
-    add_files("src/llaisys/models/*.cpp") 
+    add_files("src/llaisys/models/*.cpp")
+    on_install(no_install) -- CRITICAL FIX
 target_end()
 
 target("llaisys")
@@ -96,12 +105,12 @@ target("llaisys")
     add_deps("llaisys-core")
     add_deps("llaisys-tensor")
     add_deps("llaisys-ops")
-    add_deps("llaisys-models") -- Link the new models target
+    add_deps("llaisys-models")
 
     set_languages("cxx17")
     set_warnings("all", "error")
     add_files("src/llaisys/*.cc")
-    set_installdir(".")
+    set_installdir(".") -- Install only this to local dir
     
     after_install(function (target)
         print("Copying llaisys to python/llaisys/libllaisys/ ..")
