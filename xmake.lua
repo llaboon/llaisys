@@ -18,13 +18,14 @@ if has_config("nv-gpu") then
     includes("xmake/nvidia.lua")
 end
 
--- [Helper] Prevent installation of intermediate targets
+-- Helper to prevent install
 function no_install(target)
     -- Do nothing
 end
 
+-- [CHANGE] static -> object
 target("llaisys-utils")
-    set_kind("static")
+    set_kind("object")
     set_languages("cxx17")
     set_warnings("all", "error")
     if not is_plat("windows") then
@@ -34,8 +35,9 @@ target("llaisys-utils")
     on_install(no_install)
 target_end()
 
+-- [CHANGE] static -> object
 target("llaisys-device")
-    set_kind("static")
+    set_kind("object")
     add_deps("llaisys-utils")
     add_deps("llaisys-device-cpu")
     set_languages("cxx17")
@@ -47,8 +49,9 @@ target("llaisys-device")
     on_install(no_install)
 target_end()
 
+-- [CHANGE] static -> object
 target("llaisys-core")
-    set_kind("static")
+    set_kind("object")
     add_deps("llaisys-utils")
     add_deps("llaisys-device")
     set_languages("cxx17")
@@ -60,8 +63,9 @@ target("llaisys-core")
     on_install(no_install)
 target_end()
 
+-- [CHANGE] static -> object
 target("llaisys-tensor")
-    set_kind("static")
+    set_kind("object")
     add_deps("llaisys-core")
     set_languages("cxx17")
     set_warnings("all", "error")
@@ -72,8 +76,9 @@ target("llaisys-tensor")
     on_install(no_install)
 target_end()
 
+-- [CHANGE] static -> object
 target("llaisys-ops")
-    set_kind("static")
+    set_kind("object")
     add_deps("llaisys-ops-cpu")
     set_languages("cxx17")
     set_warnings("all", "error")
@@ -84,9 +89,9 @@ target("llaisys-ops")
     on_install(no_install)
 target_end()
 
--- [CRITICAL FIX] Change set_kind to "object" to force linking symbols
+-- [CHANGE] static -> object
 target("llaisys-models")
-    set_kind("object") 
+    set_kind("object")
     add_deps("llaisys-tensor")
     add_deps("llaisys-ops")
     add_deps("llaisys-utils")
@@ -101,12 +106,13 @@ target_end()
 
 target("llaisys")
     set_kind("shared")
+    -- Link all objects directly into the shared library
     add_deps("llaisys-utils")
     add_deps("llaisys-device")
     add_deps("llaisys-core")
     add_deps("llaisys-tensor")
     add_deps("llaisys-ops")
-    add_deps("llaisys-models") -- Will now link objects directly
+    add_deps("llaisys-models")
 
     set_languages("cxx17")
     set_warnings("all", "error")
