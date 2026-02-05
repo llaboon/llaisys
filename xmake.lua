@@ -18,9 +18,9 @@ if has_config("nv-gpu") then
     includes("xmake/nvidia.lua")
 end
 
--- [Helper Function] Prevent installation of static libs
+-- [Helper] Prevent installation of intermediate targets
 function no_install(target)
-    -- Do nothing on install
+    -- Do nothing
 end
 
 target("llaisys-utils")
@@ -31,7 +31,7 @@ target("llaisys-utils")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
     add_files("src/utils/*.cpp")
-    on_install(no_install) -- CRITICAL FIX
+    on_install(no_install)
 target_end()
 
 target("llaisys-device")
@@ -44,7 +44,7 @@ target("llaisys-device")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
     add_files("src/device/*.cpp")
-    on_install(no_install) -- CRITICAL FIX
+    on_install(no_install)
 target_end()
 
 target("llaisys-core")
@@ -57,7 +57,7 @@ target("llaisys-core")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
     add_files("src/core/*/*.cpp")
-    on_install(no_install) -- CRITICAL FIX
+    on_install(no_install)
 target_end()
 
 target("llaisys-tensor")
@@ -69,7 +69,7 @@ target("llaisys-tensor")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
     add_files("src/tensor/*.cpp")
-    on_install(no_install) -- CRITICAL FIX
+    on_install(no_install)
 target_end()
 
 target("llaisys-ops")
@@ -81,11 +81,12 @@ target("llaisys-ops")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
     add_files("src/ops/*/*.cpp")
-    on_install(no_install) -- CRITICAL FIX
+    on_install(no_install)
 target_end()
 
+-- [CRITICAL FIX] Change set_kind to "object" to force linking symbols
 target("llaisys-models")
-    set_kind("static")
+    set_kind("object") 
     add_deps("llaisys-tensor")
     add_deps("llaisys-ops")
     add_deps("llaisys-utils")
@@ -95,7 +96,7 @@ target("llaisys-models")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
     add_files("src/llaisys/models/*.cpp")
-    on_install(no_install) -- CRITICAL FIX
+    on_install(no_install)
 target_end()
 
 target("llaisys")
@@ -105,12 +106,12 @@ target("llaisys")
     add_deps("llaisys-core")
     add_deps("llaisys-tensor")
     add_deps("llaisys-ops")
-    add_deps("llaisys-models")
+    add_deps("llaisys-models") -- Will now link objects directly
 
     set_languages("cxx17")
     set_warnings("all", "error")
     add_files("src/llaisys/*.cc")
-    set_installdir(".") -- Install only this to local dir
+    set_installdir(".")
     
     after_install(function (target)
         print("Copying llaisys to python/llaisys/libllaisys/ ..")
