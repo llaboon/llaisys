@@ -52,4 +52,6 @@ __all__ = [
     "llaisysMemcpyKind_t",
     "MemcpyKind",
     "llaisysStream_t",
+    "LlaisysQwen2Meta",    
+    "LlaisysQwen2Weights" 
 ]
